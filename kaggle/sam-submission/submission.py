@@ -1,24 +1,44 @@
-"""SAM Agent - ARC-AGI-3 Kaggle Competition Submission v3.
+"""SAM Agent - ARC-AGI-3 Kaggle Competition v4.
 
-Fixed for competition mode constraints:
-- Single make() per environment (no new episodes)
-- Level Reset only (action 0 = restart current level)
-- Rate limiting to avoid 429 errors
-- Efficient exploration within single session
+Fixes:
+- Exponential backoff retry on 429 errors
+- Much more conservative exploration (fewer steps per game)
+- Proper error handling for API rate limits
 """
 
 import subprocess
 import sys
-
 subprocess.check_call([sys.executable, "-m", "pip", "install", "arc-agi>=0.9.8", "-q"])
 
 import hashlib
 import random
 import time
 import logging
+import functools
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def retry_on_429(max_retries=5, base_delay=2.0):
+    """Decorator to retry on 429 errors with exponential backoff."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    result = func(*args, **kwargs)
+                    return result
+                except Exception as e:
+                    if "429" in str(e):
+                        delay = base_delay * (2 ** attempt) + random.random()
+                        logger.info("  Rate limited, waiting %.1fs...", delay)
+                        time.sleep(delay)
+                    else:
+                        raise
+            return func(*args, **kwargs)  # Final attempt
+        return wrapper
+    return decorator
 
 
 def fast_hash(frame) -> str:
@@ -28,125 +48,133 @@ def fast_hash(frame) -> str:
     return hashlib.md5(str(layer).encode()).hexdigest()[:12]
 
 
-def solve_game(env, game_id, time_budget=600.0):
-    """Solve a game within a SINGLE session (competition mode).
-    
-    Key constraints:
-    - Only Level Resets allowed (action 0 restarts current level)
-    - Must solve levels sequentially within one make() call
-    - Rate limits on API (add small delays)
-    """
+def safe_step(env, action, data=None):
+    """Step with retry on rate limit."""
+    for attempt in range(5):
+        try:
+            result = env.step(action, data=data or {})
+            return result
+        except Exception as e:
+            if "429" in str(e):
+                delay = 2.0 * (2 ** attempt) + random.random()
+                time.sleep(delay)
+            else:
+                return None
+    return None
+
+
+def safe_reset(env):
+    """Reset with retry on rate limit."""
+    for attempt in range(5):
+        try:
+            result = env.reset()
+            return result
+        except Exception as e:
+            if "429" in str(e):
+                delay = 3.0 * (2 ** attempt) + random.random()
+                time.sleep(delay)
+            else:
+                return None
+    return None
+
+
+def solve_game(env, game_id, max_steps=2000):
+    """Solve game with conservative step budget and rate limit handling."""
     from arcengine import GameAction, GameState
 
-    frame = env.reset()
+    frame = safe_reset(env)
     if frame is None:
         return 0
 
     avail = [a for a in frame.available_actions if a != 0]
-    
     danger_pairs = set()
     best_level = 0
     current_level = 0
-    level_solutions = {}
-    deadline = time.monotonic() + time_budget
-    total_steps = 0
-    
-    # Single-session exploration: explore within level, reset on game_over
     path = []
-    
-    while time.monotonic() < deadline:
+    steps = 0
+
+    while steps < max_steps:
         if frame.state == GameState.WIN:
             best_level = max(best_level, frame.levels_completed)
             break
-        
+
         if frame.state == GameState.GAME_OVER:
-            # Mark dangerous transitions
             for h, a in path[-5:]:
                 danger_pairs.add((h, a))
-            
-            # Level Reset (goes back to current level start)
+            # Level Reset
             action = GameAction.from_id(0)
             action.action_data.game_id = game_id
-            frame = env.step(action, data={})
-            total_steps += 1
+            frame = safe_step(env, action)
+            steps += 1
             if frame is None:
                 break
             path = []
-            time.sleep(0.05)  # Rate limit protection
+            time.sleep(0.1)
             continue
-        
-        # Track level changes
+
         if frame.levels_completed > current_level:
-            # Solved a level!
-            level_solutions[current_level] = path[:]
-            logger.info("  %s: level %d solved in %d actions!", game_id, current_level, len(path))
             best_level = max(best_level, frame.levels_completed)
+            logger.info("  %s: level %d done in %d steps!", game_id, current_level, len(path))
             current_level = frame.levels_completed
             path = []
-        
-        # Choose action
+
         h = fast_hash(frame)
         safe = [a for a in avail if (h, a) not in danger_pairs]
         if not safe:
             safe = avail
-        
+
         aid = random.choice(safe)
-        
-        # Execute action
         action = GameAction.from_id(aid)
         action.action_data.game_id = game_id
+        
         if action.is_complex():
             x, y = random.randint(0, 63), random.randint(0, 63)
-            frame = env.step(action, data={"x": x, "y": y})
+            frame = safe_step(env, action, data={"x": x, "y": y})
         else:
-            frame = env.step(action, data={})
-        
+            frame = safe_step(env, action)
+
         if frame is None:
             break
-        
-        total_steps += 1
+
+        steps += 1
         path.append((h, aid))
         
-        # Periodic rate limit protection
-        if total_steps % 100 == 0:
-            time.sleep(0.1)
-    
-    logger.info("  %s: %d levels, %d steps, %d danger pairs",
-                game_id, best_level, total_steps, len(danger_pairs))
+        # Rate limit: pause every 50 steps
+        if steps % 50 == 0:
+            time.sleep(0.2)
+
+    logger.info("  %s: %d levels, %d steps", game_id, best_level, steps)
     return best_level
 
 
 def main():
     from arc_agi import Arcade, OperationMode
 
-    logger.info("SAM Agent v3 starting...")
+    logger.info("SAM Agent v4 starting...")
+    
     arc = Arcade(operation_mode=OperationMode.COMPETITION)
-
     environments = arc.get_environments()
     num_envs = len(environments)
     logger.info("Found %d environments", num_envs)
 
-    # Budget: distribute time across games
-    # Competition likely has ~2h total, be generous per game
-    total_budget = 7200.0  # 2 hours
-    time_per_game = total_budget / max(num_envs, 1)
+    # Conservative step budget per game
+    steps_per_game = min(2000, 50000 // max(num_envs, 1))
     
     total_levels = 0
-    for env_info in environments:
+    for i, env_info in enumerate(environments):
         game_id = env_info.game_id if hasattr(env_info, "game_id") else str(env_info)
-        logger.info("Playing: %s (budget: %.0fs)", game_id, time_per_game)
+        logger.info("[%d/%d] Playing: %s (%d max steps)", i+1, num_envs, game_id, steps_per_game)
 
         try:
             env = arc.make(game_id, save_recording=False)
             if env is None:
-                logger.warning("  %s: could not create env", game_id)
                 continue
-            levels = solve_game(env, game_id, time_budget=time_per_game)
+            levels = solve_game(env, game_id, max_steps=steps_per_game)
             total_levels += levels
         except Exception as e:
             logger.warning("  %s: error - %s", game_id, e)
-        
-        time.sleep(0.5)  # Pause between games
+
+        time.sleep(1.0)  # Pause between games
 
     logger.info("DONE: %d total levels across %d games", total_levels, num_envs)
 
