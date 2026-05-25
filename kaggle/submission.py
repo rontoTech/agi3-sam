@@ -86,7 +86,7 @@ class SAMCompetitionAgent:
                 from arcengine import GameAction
                 action = GameAction.from_id(0)
                 action.action_data.game_id = game_id
-                frame = env.step(action)
+                frame = env.step(action, data={})
                 if frame is None:
                     break
                 self.stats["steps"] += 1
@@ -103,14 +103,14 @@ class SAMCompetitionAgent:
             # Execute
             from arcengine import GameAction
             action = GameAction.from_id(aid)
-            if action.is_simple():
-                action.action_data.game_id = game_id
-            elif action.is_complex():
-                x, y = self._pick_coords(frame, has_click)
-                action.set_data({"game_id": game_id, "x": x, "y": y})
-
+            action.action_data.game_id = game_id
+            
             prev_hash = h
-            frame = env.step(action)
+            if action.is_complex():
+                x, y = self._pick_coords(frame, has_click)
+                frame = env.step(action, data={"x": x, "y": y})
+            else:
+                frame = env.step(action)
             if frame is None:
                 break
 
