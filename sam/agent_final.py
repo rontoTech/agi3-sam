@@ -245,10 +245,24 @@ class FinalCompetitionAgent:
     def _explore_solve(
         self, env: EnvironmentWrapper, frame: FrameDataRaw, level: int, budget: int
     ) -> tuple[FrameDataRaw | None, int, bool]:
-        """Systematic exploration fallback."""
+        """Graph-based exploration with frontier navigation.
+        
+        Builds a state graph and uses BFS to navigate to unexplored frontiers.
+        Key improvements:
+        - Detects no-ops (action doesn't change state)
+        - After exhausting a state, navigates to nearest frontier via RESET+replay
+        - Uses momentum (prefer continuing in same direction)
+        """
+        from collections import deque
+        
         steps = 0
-        states: dict[str, set[int]] = {}
-        path: list[int] = []
+        graph: dict[str, dict[int, str]] = {}
+        noops: dict[str, set[int]] = {}
+        root_hash = frame_hash(frame)
+        graph[root_hash] = {}
+        noops[root_hash] = set()
+        current_path: list[int] = []
+        replay_queue: list[int] = []
         
         while steps < budget:
             if frame.state == GameState.WIN:
@@ -258,22 +272,38 @@ class FinalCompetitionAgent:
                 if frame is None:
                     return None, steps, False
                 steps += 1
-                path = []
+                current_path = []
+                replay_queue = []
                 continue
             if frame.levels_completed > level:
                 return frame, steps, True
             
-            cur_hash = frame_hash(frame)
-            if cur_hash not in states:
-                states[cur_hash] = set()
+            if replay_queue:
+                aid = replay_queue.pop(0)
+                frame = env.step(self._make_action(aid))
+                if frame is None:
+                    return None, steps, False
+                steps += 1
+                current_path.append(aid)
+                if frame.levels_completed > level:
+                    return frame, steps, True
+                continue
             
-            tried = states[cur_hash]
+            cur_hash = frame_hash(frame)
+            if cur_hash not in graph:
+                graph[cur_hash] = {}
+                noops[cur_hash] = set()
+            
+            node = graph[cur_hash]
+            noop_set = noops[cur_hash]
             avail = [a for a in frame.available_actions if a != 0]
-            untried = [a for a in avail if a not in tried]
+            untried = [a for a in avail if a not in node and a not in noop_set]
             
             if untried:
-                aid = untried[0]
-                tried.add(aid)
+                if current_path and current_path[-1] in untried:
+                    aid = current_path[-1]
+                else:
+                    aid = untried[0]
                 
                 before_hash = cur_hash
                 frame = env.step(self._make_action(aid))
@@ -282,19 +312,54 @@ class FinalCompetitionAgent:
                 steps += 1
                 
                 new_hash = frame_hash(frame)
-                if new_hash != before_hash:
-                    path.append(aid)
+                if new_hash == before_hash:
+                    noop_set.add(aid)
+                else:
+                    node[aid] = new_hash
+                    current_path.append(aid)
+                    if new_hash not in graph:
+                        graph[new_hash] = {}
+                        noops[new_hash] = set()
                 
                 if frame.levels_completed > level:
                     return frame, steps, True
             else:
+                frontier = self._bfs_frontier(graph, noops, root_hash, level)
+                if frontier is None:
+                    return frame, steps, False
+                
                 frame = self._reset(env)
                 if frame is None:
                     return None, steps, False
                 steps += 1
-                path = []
+                current_path = []
+                replay_queue = list(frontier)
         
         return frame, steps, False
+
+    def _bfs_frontier(
+        self, graph: dict, noops: dict, root: str, level: int
+    ) -> list[int] | None:
+        """BFS from root to find shortest path to node with untried actions."""
+        from collections import deque
+        queue: deque[tuple[str, list[int]]] = deque([(root, [])])
+        visited = {root}
+        
+        while queue:
+            h, path = queue.popleft()
+            if len(path) > 200:
+                continue
+            node = graph.get(h, {})
+            noop_set = noops.get(h, set())
+            avail_actions = [1, 2, 3, 4]
+            untried = [a for a in avail_actions if a not in node and a not in noop_set]
+            if untried and path:
+                return path
+            for aid, next_h in node.items():
+                if next_h not in visited:
+                    visited.add(next_h)
+                    queue.append((next_h, path + [aid]))
+        return None
 
     def _policy_action(self, frame: FrameDataRaw, avail: list[int]) -> int:
         """Select action using trained policy."""
